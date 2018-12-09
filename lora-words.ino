@@ -316,9 +316,11 @@ void show_gui(String text, int ssi){
 	display.drawString(0, 20, text);
 
 	// From.
-	display.setTextAlignment(TEXT_ALIGN_LEFT);
-	display.setFont(ArialMT_Plain_10);
-	display.drawString(0, 40, String(this_packet.from));
+	if (ssi != RSSI_NO_SIGNAL) {
+		display.setTextAlignment(TEXT_ALIGN_LEFT);
+		display.setFont(ArialMT_Plain_10);
+		display.drawString(0, 44, "From: " + String(this_packet.from));
+	}
 
 
 	// And render...
@@ -333,7 +335,7 @@ void setup_ntp() {
 		return;
 	}
 
-	Serial.println("Contacting Time Server");
+	Serial.println("Setting up NTP...");
 
 	show_startup_screen("Contacting time server...", "", "", "", "", 30);
 
@@ -352,12 +354,16 @@ void setup_ntp() {
 
 	delay(1000);
 
+	Serial.println("NTP set up.");
+
 	ntp_up = true;
 
 	return;
 }
 
 bool setup_mdns(char* host){
+
+	Serial.println("Setting up MDNS...");
 
 	show_startup_screen("Registering as", String(host) + "...", "", "", "", 60);
 
@@ -374,6 +380,8 @@ bool setup_mdns(char* host){
 
 	show_startup_screen("Registering as", String(host) + "...", "Succeeded", "", "", 70);
 
+	Serial.println("MDNS set up.");
+
 	mdns_up = true;
 
 	delay(1000);
@@ -386,6 +394,8 @@ void setup_wifi(void)
 	byte count = 0;
 	byte max_tries = 8;
 
+	Serial.println("Setting up WiFi...");
+
 	// Set WiFi to station mode and disconnect from an AP if it was previously connected
 	WiFi.disconnect(true);
 
@@ -394,7 +404,6 @@ void setup_wifi(void)
 	delay(1000);
 
 	strcpy (hostname, my_name);
-	Serial.println("Setting hostname to: " + String(hostname));
 
 	WiFi.setHostname(hostname);
 	WiFi.mode(WIFI_STA);
@@ -430,6 +439,8 @@ void setup_wifi(void)
 			show_startup_screen("Connected to WiFi.", WiFi.SSID(), "IP:" + String(WiFi.localIP().toString()), "", "", 20);
 			wifi_up = true;
 
+			Serial.println("WiFi connected. [" + WiFi.SSID() + "]");
+
 			break;
 		}
 		else // Connect failed. Try the next network.
@@ -462,6 +473,8 @@ void setup_screen (){
 }
 
 void setup_lora(){
+
+	Serial.println("Setting up LoRa...");
 
 	show_startup_screen("Starting LoRa...", "", "", "", "", 80);
 
@@ -496,6 +509,8 @@ void whoami (){
 
 	// Use last 4 hex digits (reversed to match MAC) as name.
 	sprintf (my_name, "%s%02X%02X", NAME_PREFIX, ((uint16_t)(chipid>>32) & 0x00ff), ((uint16_t)(chipid>>32) >> 8));
+
+	Serial.println("My name is: " + String(my_name));
 
 	return;
 }
@@ -653,13 +668,13 @@ void loop()
 	delay(200);
 }
 
-bool unpack_packet (const char* in_packet) {
+bool unpack_packet (const char* in_packet, pp_packet* parsed_packet) {
 
 	byte count = 0;
 	bool rtn = false;
 	char* token = NULL;
 
-	memset (&this_packet, 0, sizeof (this_packet));
+	memset (parsed_packet, 0, sizeof (pp_packet));
 
 	// Get the first divider.
 	token = strtok((char*) in_packet, (char*) PACKET_DIV_STR);
@@ -668,22 +683,22 @@ bool unpack_packet (const char* in_packet) {
 
 		switch (count) {
 			case 0:
-				strncpy (this_packet.from, token, PACKET_HOST_SIZE);
+				strncpy (parsed_packet->from, token, PACKET_HOST_SIZE);
 //				Serial.println("Got token: '" + String (token) + "'");
 				break;
 
 			case 1:
-				strncpy (this_packet.to, token, PACKET_HOST_SIZE);
+				strncpy (parsed_packet->to, token, PACKET_HOST_SIZE);
 //				Serial.println("Got token: '" + String (token) + "'");
 				break;
 
 			case 2:
-				strncpy (this_packet.payload, token, PACKET_PAYLOAD_SIZE);
+				strncpy (parsed_packet->payload, token, PACKET_PAYLOAD_SIZE);
 //				Serial.println("Got token: '" + String (token) + "'");
 				break;
 
 			case 3:
-				strncpy (this_packet.sequence, token, PACKET_SEQ_SIZE);
+				strncpy (parsed_packet->sequence, token, PACKET_SEQ_SIZE);
 //				Serial.println("Got token: '" + String (token) + "'");
 				rtn = true;
 				break;
@@ -701,6 +716,8 @@ bool unpack_packet (const char* in_packet) {
 void onReceive(int packetSize)//LoRa receiver interrupt service
 {
 	char str_packet[PACKET_STRING_SIZE+1] = "";
+
+	pp_packet temp_packet;
 
 	packet = "";
     packSize = String(packetSize,DEC);
@@ -724,15 +741,27 @@ void onReceive(int packetSize)//LoRa receiver interrupt service
 	received_signal_strength = LoRa.packetRssi();
 
 	// Unpack the packet.
-	if (unpack_packet(str_packet)) {
+	if (unpack_packet(str_packet, &temp_packet)) {
 /*		Serial.println ("Packet: [" + packet + "]");
 		Serial.println ("-> From:    " + String(this_packet.from));
 		Serial.println ("-> To:      " + String(this_packet.to));
 		Serial.println ("-> Payload: " + String(this_packet.payload));
 		Serial.println ("-> Seq:     " + String(this_packet.sequence)); */
-	}	
+
+		// Only store the new packet if we've successfully unpacked and it's for us.
+		if (strncmp (temp_packet.to, my_name, PACKET_HOST_SIZE) || (strncmp(PACKET_BROADCAST, temp_packet.to, PACKET_HOST_SIZE))){
+
+			Serial.println("-> Processsing packet.");
+
+			memcpy(&this_packet, &temp_packet, sizeof(this_packet));
+
+			// Could set a 'new packet' flag here.
+		}
+
+//	    receiveflag = true;
+	}
 
 	receive_mutex = false;
 
-    receiveflag = true;
+    //receiveflag = true;
 }
