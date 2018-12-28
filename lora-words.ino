@@ -36,6 +36,8 @@
 #include "words.h"
 #include "signal_strength_xbm.h"
 #include "wifi_strength_xbm.h"
+#include "batt_charge_xbm.h"
+
 #include "wifi_config.h"		// WiFi SSID and password.
 
 // Pin definetion of WIFI LoRa 32
@@ -50,6 +52,7 @@
 #define SCL     15
 #define RSTOLED  16   //RST must be set by software
 #define Light  25
+#define ADC_VCC	(13)	// ADC to measure supply voltage. Only valid for Heltec ESP32.
 #define V2  1
 
 #ifdef V2 //WIFI Kit series V1 not support Vext control
@@ -76,6 +79,8 @@
 
 #define NAME_PREFIX		("LORA")
 
+#define NO_DISPLAY_HOST	("LORAB2D4")	// The LoRa module with a broken display.
+
 String rssi = "RSSI --";
 String packSize = "--";
 String packet;
@@ -90,11 +95,14 @@ long lastSendTime = 0;        	// last send time
 long lastReceiveTime = 0;     	// last packet received
 int interval = 1000;          	// interval between sends
 
-bool use_display = false;
+long lastVCCTime = 0;     		// Last time supply voltage checked.
+int vcc_interval = 5 * 1000;   	// Interval between checks.
+
+bool use_display = true;		// Always enable display (will be disabled later, if needed).
 
 bool receive_mutex = false;
 
-char time_buffer[9] = ""; // HH:MM:SS
+char time_buffer[9] = ""; // HH:MM:SS + NULL
 
 int received_signal_strength = RSSI_NO_SIGNAL;
 
@@ -109,6 +117,7 @@ bool mdns_up = false;
 char hostname[64] = "";
 char my_name[9] = "";
 
+double vcc = 0;
 
 /*
  * Key feature flag. 
@@ -252,6 +261,65 @@ unsigned char* lora_rssi_xbm (int rssi) {
 	return xbm;
 }
 
+/*
+ * Return a bitmap representing the supply voltage.
+ * 
+ * 
+ */
+unsigned char* vcc_xbm (double volts) {
+
+	unsigned char* xbm = batt_image_0;
+
+	if (volts >= 1.5) {
+		xbm = batt_image_40;
+	}
+
+	if (volts >= 2.0) {
+		xbm = batt_image_60;
+	}
+
+	if (volts >= 2.5) {
+		xbm = batt_image_80;
+	}
+
+	if (volts >= 3.0) {
+		xbm = batt_image_100;
+	}
+
+	return xbm;
+}
+
+/* ADC readings v voltage
+ *  y = -0.000000000009824x3 + 0.000000016557283x2 + 0.000854596860691x + 0.065440348345433
+ // Polynomial curve match, based on raw data thus:
+ *   464     0.5
+ *  1088     1.0
+ *  1707     1.5
+ *  2331     2.0
+ *  2951     2.5 
+ *  3775     3.0
+ *  
+ */
+double read_voltage(){
+  
+	double reading = analogRead(ADC_VCC); // Reference voltage is 3v3 so maximum reading is 3v3 = 4095 in range 0 to 4095
+
+//	Serial.println("Vcc ADC reading: " + String(reading));
+
+	if(reading < 1 || reading > 4095) {
+		Serial.println("Vcc: reading out of range.");
+
+		return 0;
+	}
+
+	vcc = -0.000000000000016 * pow(reading,4) + 0.000000000118171 * pow(reading,3)- 0.000000301211691 * pow(reading,2)+ 0.001109019271794 * reading + 0.034143524634089;
+  
+	Serial.println("Vcc: " + String(vcc));
+
+	return vcc;
+}
+
+
 void check_time (){
 
 	struct tm tmstruct;
@@ -287,21 +355,37 @@ void show_gui(String text, int ssi){
 
 	// RSSI of the most recent packet received, in text.
 	if (ssi != RSSI_NO_SIGNAL) {
+		display.setTextAlignment(TEXT_ALIGN_LEFT);
 		display.setFont(ArialMT_Plain_10);
 		display.drawString(0, 54, "RSSI: " + String(ssi));
 	}
 
+	// Supply voltage.
+  	display.drawXbm(DISPLAY_WIDTH - BATT_IMAGE_WIDTH, 0, 
+	  				BATT_IMAGE_WIDTH, BATT_IMAGE_HEIGHT, 
+					vcc_xbm(vcc));
+
+	if (0) {
+		char buf[32] = "";
+		sprintf(buf, "Vcc: %0.2f V", vcc);
+		display.setTextAlignment(TEXT_ALIGN_RIGHT);
+		display.setFont(ArialMT_Plain_10);
+		display.drawString(DISPLAY_WIDTH, 10, String(buf));
+	}
+
+
 	// RSSI of the most recent packet received, as a bitmap.
-  	display.drawXbm(DISPLAY_WIDTH - SIGNAL_IMAGE_WIDTH, 0, 
+  	display.drawXbm(DISPLAY_WIDTH - SIGNAL_IMAGE_WIDTH - (BATT_IMAGE_WIDTH + 2), 0, 
 	  				SIGNAL_IMAGE_WIDTH, SIGNAL_IMAGE_HEIGHT, 
 					lora_rssi_xbm(ssi));
 
 	// The time.
+	display.setTextAlignment(TEXT_ALIGN_LEFT);
 	display.setFont(ArialMT_Plain_10);
 	display.drawString(0, 0, String(time_buffer));
 
 	// RSSI of the WiFi connection.
-  	display.drawXbm(DISPLAY_WIDTH - SIGNAL_IMAGE_WIDTH - WIFI_IMAGE_WIDTH, 0, 
+  	display.drawXbm(DISPLAY_WIDTH - (SIGNAL_IMAGE_WIDTH + 1) - WIFI_IMAGE_WIDTH - (BATT_IMAGE_WIDTH + 2), 0, 
 	  				SIGNAL_IMAGE_WIDTH, SIGNAL_IMAGE_HEIGHT, 
 					wifi_rssi_xbm(WiFi.RSSI()));
 
@@ -565,8 +649,9 @@ void setup()
 	// Get my ID.
 	whoami();
 
-	if(!words_sender) {
-		use_display = true;
+	if (0 == strcmp (NO_DISPLAY_HOST, my_name)) {
+		Serial.println("LoRa module with a broken display - not enabling screen.");
+		use_display = false;
 	}
 
 	// PP override.
@@ -597,6 +682,10 @@ void setup()
 
 	setup_lora();
 
+	// Read the supply voltage on startup.
+	read_voltage();
+
+
 	if (!words_sender) {
 
 		Serial.println("Setting radio to receive mode.");
@@ -620,6 +709,14 @@ void loop()
 {
 	// Make the LED blink.
 	light_on();
+
+	// Check the battery every 5 secs, or on startup.
+	if(millis() - lastVCCTime > vcc_interval)
+	{
+		read_voltage();
+
+		lastVCCTime = millis();
+	}
 
 	// Sender.
 	if (words_sender){
